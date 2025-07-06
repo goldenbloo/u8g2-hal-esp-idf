@@ -13,8 +13,18 @@ static const char* TAG = "u8g2_hal";
 static const unsigned int I2C_TIMEOUT_MS = 1000;
 
 static spi_device_handle_t handle_spi;   // SPI handle.
-static i2c_cmd_handle_t handle_i2c;      // I2C handle.
+
+#ifdef CONFIG_USE_LEGACY_I2C_DRIVER
+static i2c_cmd_handle_t handle_i2c;      // I2C handle. Old
+#else
+static i2c_master_bus_handle_t handle_i2c_bus; // I2C bus handle
+static i2c_master_dev_handle_t handle_i2c_dev; // I2C device handle
+static uint8_t i2c_buffer[128];
+static size_t i2c_buffer_idx;
+#endif
 static u8g2_esp32_hal_t u8g2_esp32_hal;  // HAL state data.
+
+
 
 #define HOST    SPI2_HOST
 
@@ -132,6 +142,7 @@ uint8_t u8g2_esp32_i2c_byte_cb(u8x8_t* u8x8,
         break;
       }
 
+      #ifdef CONFIG_USE_LEGACY_I2C_DRIVER
       i2c_config_t conf = {0};
       conf.mode = I2C_MODE_MASTER;
       ESP_LOGI(TAG, "sda_io_num %d", u8g2_esp32_hal.bus.i2c.sda);
@@ -148,38 +159,90 @@ uint8_t u8g2_esp32_i2c_byte_cb(u8x8_t* u8x8,
       ESP_ERROR_CHECK(i2c_driver_install(I2C_MASTER_NUM, conf.mode,
                                          I2C_MASTER_RX_BUF_DISABLE,
                                          I2C_MASTER_TX_BUF_DISABLE, 0));
+      #else
+      ESP_LOGI(TAG, "Initializing I2C master bus.");
+      i2c_master_bus_config_t i2c_mst_config = {
+          .clk_source = I2C_CLK_SRC_DEFAULT,
+          .i2c_port = I2C_MASTER_NUM,
+          .scl_io_num = u8g2_esp32_hal.bus.i2c.scl,
+          .sda_io_num = u8g2_esp32_hal.bus.i2c.sda,
+          .glitch_ignore_cnt = 7,
+          .flags.enable_internal_pullup = true};
+      ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_mst_config, &handle_i2c_bus));
+      #endif
       break;
     }
+
 
     case U8X8_MSG_BYTE_SEND: {
       uint8_t* data_ptr = (uint8_t*)arg_ptr;
       ESP_LOG_BUFFER_HEXDUMP(TAG, data_ptr, arg_int, ESP_LOG_VERBOSE);
-
+      
+      #ifdef CONFIG_USE_LEGACY_I2C_DRIVER
       while (arg_int > 0) {
         ESP_ERROR_CHECK(
             i2c_master_write_byte(handle_i2c, *data_ptr, ACK_CHECK_EN));
         data_ptr++;
         arg_int--;
       }
+      #else
+      
+      if (i2c_buffer_idx + arg_int > sizeof(i2c_buffer)) {
+        ESP_LOGE(TAG, "I2C buffer overflow!");        
+        break;
+      }
+      memcpy(&i2c_buffer[i2c_buffer_idx], data_ptr, arg_int);
+      i2c_buffer_idx += arg_int;
+      #endif
       break;
     }
 
+
     case U8X8_MSG_BYTE_START_TRANSFER: {
       uint8_t i2c_address = u8x8_GetI2CAddress(u8x8);
+
+      #ifdef CONFIG_USE_LEGACY_I2C_DRIVER
       handle_i2c = i2c_cmd_link_create();
       ESP_LOGD(TAG, "Start I2C transfer to %02X.", i2c_address >> 1);
       ESP_ERROR_CHECK(i2c_master_start(handle_i2c));
       ESP_ERROR_CHECK(i2c_master_write_byte(
           handle_i2c, i2c_address | I2C_MASTER_WRITE, ACK_CHECK_EN));
+      #else
+      ESP_LOGD(TAG, "Start I2C transfer to address 0x%02X.", i2c_address );
+      
+      if (handle_i2c_dev == NULL) {
+        i2c_device_config_t dev_cfg = {
+            .dev_addr_length = I2C_ADDR_BIT_7,
+            .device_address = i2c_address,  
+            .scl_speed_hz = I2C_MASTER_FREQ_HZ,
+        };
+        ESP_ERROR_CHECK(i2c_master_bus_add_device(handle_i2c_bus, &dev_cfg,
+                                                  &handle_i2c_dev));
+      }     
+      i2c_buffer_idx = 0;
+      #endif
+      
       break;
     }
 
     case U8X8_MSG_BYTE_END_TRANSFER: {
-      ESP_LOGD(TAG, "End I2C transfer.");
+      #ifdef CONFIG_USE_LEGACY_I2C_DRIVER
+       ESP_LOGD(TAG, "End I2C transfer.");
       ESP_ERROR_CHECK(i2c_master_stop(handle_i2c));
       ESP_ERROR_CHECK(i2c_master_cmd_begin(I2C_MASTER_NUM, handle_i2c,
                                            pdMS_TO_TICKS(I2C_TIMEOUT_MS)));
       i2c_cmd_link_delete(handle_i2c);
+
+      #else
+      ESP_LOGD(TAG, "End I2C transfer. Transmitting %d bytes.", i2c_buffer_idx);      
+      if (i2c_buffer_idx > 0) {
+        esp_err_t err = i2c_master_transmit(handle_i2c_dev, i2c_buffer,i2c_buffer_idx, pdMS_TO_TICKS(I2C_TIMEOUT_MS));
+        if (err != ESP_OK)
+        ESP_LOGE(TAG,"Transmission failed. Error: %s", esp_err_to_name(err));
+      }
+      #endif
+
+      
       break;
     }
   }

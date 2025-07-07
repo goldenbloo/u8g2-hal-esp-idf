@@ -34,7 +34,7 @@
 #define ACK_CHECK_EN 0x1             //  I2C master will check ack from slave
 #define ACK_CHECK_DIS 0x0  //  I2C master will not check ack from slave
 #endif
-#define I2C_MASTER_FREQ_HZ 50000     //  I2C master clock frequency
+#define I2C_MASTER_FREQ_HZ 400000     //  I2C master clock frequency
 
 
 /** @public
